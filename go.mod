@@ -23,6 +23,8 @@ require (
 	gopkg.in/fsnotify.v1 v1.4.7
 )
 
+replace github.com/networkservicemesh/sdk-ovs => github.com/Nordix/sdk-ovs v0.0.0-20240219105747-475bf7c623c2
+
 require (
 	cloud.google.com/go/compute/metadata v0.2.3 // indirect
 	github.com/Mellanox/sriovnet v1.0.3-0.20210630121212-0453bd4b7fbc // indirect

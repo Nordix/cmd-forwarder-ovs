@@ -60,7 +60,6 @@ import (
 	"github.com/networkservicemesh/sdk/pkg/tools/spiffejwt"
 	"github.com/networkservicemesh/sdk/pkg/tools/token"
 	"github.com/networkservicemesh/sdk/pkg/tools/tracing"
-	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/util"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
@@ -81,6 +80,7 @@ type Config struct {
 	NSName                 string            `default:"forwarder" desc:"Name of Network Service to Register with Registry"`
 	BridgeName             string            `default:"br-nsm" desc:"Name of the OvS bridge"`
 	TunnelIP               string            `desc:"IP or CIDR to use for tunnels" split_words:"true"`
+	VxlanPort              uint16            `default:"0" desc:"VXLAN port to use" split_words:"true"`
 	ConnectTo              url.URL           `default:"unix:///connect.to.socket" desc:"url to connect to" split_words:"true"`
 	DialTimeout            time.Duration     `default:"50ms" desc:"Timeout for the dial the next endpoint" split_words:"true"`
 	MaxTokenLifetime       time.Duration     `default:"24h" desc:"maximum lifetime of tokens" split_words:"true"`
@@ -159,6 +159,7 @@ func main() {
 	log.FromContext(ctx).Infof("executing phase 2: ensure ovs is running (time since start: %s)", time.Since(starttime))
 	// ********************************************************************************
 	now = time.Now()
+	hostOvs := false
 	if !ovsinit.IsOvsRunning() {
 		// start ovs by supervisord
 		ovsErrCh := ovsinit.StartSupervisord(ctx)
@@ -168,6 +169,7 @@ func main() {
 		}
 		log.FromContext(ctx).Info("local ovs is being used")
 	} else {
+		hostOvs = true
 		log.FromContext(ctx).Info("host ovs is being used")
 	}
 	log.FromContext(ctx).WithField("duration", time.Since(now)).Info("completed phase 2: ensure ovs is running")
@@ -195,17 +197,10 @@ func main() {
 	// ********************************************************************************
 	log.FromContext(ctx).Infof("executing phase 4: create ovsxconnect network service endpoint (time since start: %s)", time.Since(starttime))
 	// ********************************************************************************
-	xConnectEndpoint, err := createInterposeEndpoint(ctx, config, tlsClientConfig, source)
+	xConnectEndpoint, err := createInterposeEndpoint(ctx, config, tlsClientConfig, source, hostOvs)
 	if err != nil {
 		logrus.Fatalf("error configuring forwarder endpoint: %+v", err)
 	}
-	defer func() {
-		stdout, stderr, cmdErr := util.RunOVSVsctl("del-br", config.BridgeName)
-		if err != nil {
-			log.FromContext(ctx).Fatalf("Failed to remove bridge %s, stdout: %q, stderr: %q, error: %v", config.BridgeName, stdout, stderr, cmdErr)
-		}
-		log.FromContext(ctx).Debugf("Bridge %s removed", config.BridgeName)
-	}()
 	log.FromContext(ctx).WithField("duration", time.Since(now)).Info("completed phase 4: create ovsxconnect network service endpoint")
 
 	// ********************************************************************************
@@ -317,22 +312,22 @@ func parseTunnelIPCIDR(tunnelIPStr string) (net.IP, error) {
 	return egressTunnelIP, err
 }
 
-func createInterposeEndpoint(ctx context.Context, config *Config, tlsClientConfig *tls.Config, source x509svid.Source) (xConnectEndpoint endpoint.Endpoint, err error) {
+func createInterposeEndpoint(ctx context.Context, config *Config, tlsClientConfig *tls.Config, source x509svid.Source, isHostOvs bool) (xConnectEndpoint endpoint.Endpoint, err error) {
 	egressTunnelIP, err := parseTunnelIPCIDR(config.TunnelIP)
 	if err != nil {
 		return
 	}
 	l2cMap := getL2ConnectionPointMap(ctx, config)
 	if isSriovConfig(config.SRIOVConfigFile) {
-		xConnectEndpoint, err = createSriovInterposeEndpoint(ctx, config, tlsClientConfig, source, egressTunnelIP, l2cMap)
+		xConnectEndpoint, err = createSriovInterposeEndpoint(ctx, config, tlsClientConfig, source, egressTunnelIP, l2cMap, isHostOvs)
 	} else {
-		xConnectEndpoint, err = createKernelInterposeEndpoint(ctx, config, tlsClientConfig, source, egressTunnelIP, l2cMap)
+		xConnectEndpoint, err = createKernelInterposeEndpoint(ctx, config, tlsClientConfig, source, egressTunnelIP, l2cMap, isHostOvs)
 	}
 	return
 }
 
 func createKernelInterposeEndpoint(ctx context.Context, config *Config, tlsConfig *tls.Config, source x509svid.Source,
-	egressTunnelIP net.IP, l2cMap map[string]*ovsutil.L2ConnectionPoint) (endpoint.Endpoint, error) {
+	egressTunnelIP net.IP, l2cMap map[string]*ovsutil.L2ConnectionPoint, isHostOvs bool) (endpoint.Endpoint, error) {
 	var spiffeidmap genericsync.Map[spiffeid.ID, *genericsync.Map[string, struct{}]]
 
 	return forwarder.NewKernelServer(
@@ -346,6 +341,7 @@ func createKernelInterposeEndpoint(ctx context.Context, config *Config, tlsConfi
 		egressTunnelIP,
 		config.DialTimeout,
 		l2cMap,
+		isHostOvs,
 		grpc.WithBlock(),
 		grpc.WithTransportCredentials(
 			grpcfd.TransportCredentials(credentials.NewTLS(tlsConfig))),
@@ -358,7 +354,7 @@ func createKernelInterposeEndpoint(ctx context.Context, config *Config, tlsConfi
 }
 
 func createSriovInterposeEndpoint(ctx context.Context, config *Config, tlsConfig *tls.Config, source x509svid.Source,
-	egressTunnelIP net.IP, l2cMap map[string]*ovsutil.L2ConnectionPoint) (endpoint.Endpoint, error) {
+	egressTunnelIP net.IP, l2cMap map[string]*ovsutil.L2ConnectionPoint, isHostOvs bool) (endpoint.Endpoint, error) {
 	sriovConfig, err := sriovconfig.ReadConfig(ctx, config.SRIOVConfigFile)
 	if err != nil {
 		return nil, err
@@ -405,6 +401,7 @@ func createSriovInterposeEndpoint(ctx context.Context, config *Config, tlsConfig
 		sriovConfig,
 		config.DialTimeout,
 		l2cMap,
+		isHostOvs,
 		grpc.WithBlock(),
 		grpc.WithTransportCredentials(
 			grpcfd.TransportCredentials(credentials.NewTLS(tlsConfig))),
